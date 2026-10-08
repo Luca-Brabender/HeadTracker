@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>3D Head Pose & Gaze Zone Detection</title>
+  
+  <!-- MediaPipe Libraries via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background-color: #111;
+      color: #fff;
+      overflow: hidden;
+    }
+
+    #view-container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    video {
+      transform: scaleX(-1); /* Spiegelverkehrt darstellen */
+      width: 320px;
+      height: 240px;
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      border: 2px solid #333;
+      border-radius: 8px;
+      z-index: 10;
+    }
+
+    #zone-display {
+      font-size: 3rem;
+      font-weight: bold;
+      text-align: center;
+      padding: 40px;
+      border-radius: 16px;
+      border: 4px dashed #555;
+      background: rgba(255, 255, 255, 0.05);
+      transition: all 0.15s ease;
+    }
+
+    /* Zonen-Farben */
+    .zone-bildschirm {
+      border-color: #00ffcc !important;
+      color: #00ffcc;
+      background: rgba(0, 255, 204, 0.1) !important;
+    }
+
+    .zone-infotainment {
+      border-color: #ff9900 !important;
+      color: #ff9900;
+      background: rgba(255, 153, 0, 0.15) !important;
+    }
+
+    .zone-lenkrad {
+      border-color: #0099ff !important;
+      color: #0099ff;
+      background: rgba(0, 153, 255, 0.15) !important;
+    }
+
+    .zone-weggedreht {
+      border-color: #ff3366 !important;
+      color: #ff3366;
+      background: rgba(255, 51, 102, 0.15) !important;
+    }
+
+    /* UI Overlay */
+    #ui-overlay {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(0, 0, 0, 0.85);
+      padding: 20px;
+      border-radius: 10px;
+      font-family: monospace;
+      font-size: 0.95rem;
+      z-index: 100;
+    }
+
+    .val-highlight {
+      color: #00ffcc;
+      font-weight: bold;
+    }
+
+    button {
+      background: #00ffcc;
+      color: #000;
+      border: none;
+      padding: 10px 16px;
+      margin-top: 15px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+
+    button:hover {
+      background: #00cca3;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="ui-overlay">
+    <h2>3D Head Pose Gaze Tracker</h2>
+    <div>Status: <span id="status" class="val-highlight">Initialisiere...</span></div>
+    <div>Blick-Zone: <span id="current-zone" class="val-highlight">KEINE</span></div>
+    <hr style="border-color: #444; margin: 10px 0;">
+    <div>Kopf-Drehung (Yaw / Links-Rechts): <span id="val-yaw" class="val-highlight">0</span></div>
+    <div>Kopf-Neigung (Pitch / Oben-Unten): <span id="val-pitch" class="val-highlight">0</span></div>
+    <button id="btn-export">Messdaten als CSV exportieren</button>
+  </div>
+
+  <div id="view-container">
+    <div id="zone-display">Warte auf Kamera...</div>
+    <video id="webcam" autoplay playsinline></video>
+  </div>
+
+  <script>
+    let logs = [];
+    let currentZone = "UNBEKANNT";
+    const videoElement = document.getElementById('webcam');
+    const zoneDisplay = document.getElementById('zone-display');
+    const currentZoneEl = document.getElementById('current-zone');
+    const statusEl = document.getElementById('status');
+    const valYaw = document.getElementById('val-yaw');
+    const valPitch = document.getElementById('val-pitch');
+
+    // MediaPipe FaceMesh Setup
+    const faceMesh = new FaceMesh({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+    });
+
+    faceMesh.setOptions({
+      maxNumFaces: 1,
+      refineLandmarks: true,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+
+    faceMesh.onResults(onResults);
+
+    // Kamera starten
+    const camera = new Camera(videoElement, {
+      onFrame: async () => {
+        await faceMesh.send({ image: videoElement });
+      },
+      width: 640,
+      height: 480
+    });
+
+    camera.start().then(() => {
+      statusEl.textContent = "Kamera Aktiv / Trackt";
+    });
+
+    function onResults(results) {
+      if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+        updateZone("SONSTIGES_WEGGEDREHT", 0, 0);
+        return;
+      }
+
+      const landmarks = results.multiFaceLandmarks[0];
+
+      // Relevante 3D Gesichtspunkte extrahieren:
+      // Nose Tip: 1 | Chin: 152 | Left Eye: 33 | Right Eye: 263
+      const nose = landmarks[1];
+      const leftEye = landmarks[33];
+      const rightEye = landmarks[263];
+      const chin = landmarks[152];
+
+      // Mittelpunkt zwischen den Augen berechnen
+      const eyeCenter = {
+        x: (leftEye.x + rightEye.x) / 2,
+        y: (leftEye.y + rightEye.y) / 2,
+        z: (leftEye.z + rightEye.z) / 2
+      };
+
+      // 1. Yaw (Kopfdrehung nach Links/Rechts): Verschiebung der Nase relativ zu den Augen
+      // Da das Bild gespiegelt ist: Positiv = Kopfdrehung nach Rechts (vom Nutzer aus gesehen)
+      const yaw = (eyeCenter.x - nose.x) * 100;
+
+      // 2. Pitch (Kopfneigung Oben/Unten): relativer Abstand Nase zu Kinn / Augen
+      const pitch = (nose.y - eyeCenter.y) * 100;
+
+      valYaw.textContent = yaw.toFixed(1);
+      valPitch.textContent = pitch.toFixed(1);
+
+      // ZONEN-LOGIK FÜR DRIVER STUDY
+      let detectedZone = "BILDSCHIRM";
+
+      // Schwellenwerte für Neigung und Drehung:
+      // Pitch > 3.5 = Kopf spürbar nach unten geneigt
+      // Yaw > 2.0 = Kopf nach rechts gedreht
+      if (pitch > 3.0 && yaw > 1.5) {
+        detectedZone = "INFOTAINMENT"; // Rechts unten
+      } else if (pitch > 3.0 && yaw < -1.5) {
+        detectedZone = "LENKRAD"; // Links unten
+      } else if (pitch > 5.0) {
+        detectedZone = "LENKRAD"; // Stark nach unten geschaut
+      } else if (Math.abs(yaw) > 6.0 || pitch < -4.0) {
+        detectedZone = "SONSTIGES_WEGGEDREHT";
+      } else {
+        detectedZone = "BILDSCHIRM"; // Blick auf die Straße / Hauptbildschirm
+      }
+
+      updateZone(detectedZone, yaw, pitch);
+
+      // Datenpunkt loggen
+      logs.push({
+        timestamp: Date.now(),
+        yaw: yaw.toFixed(2),
+        pitch: pitch.toFixed(2),
+        zone: detectedZone
+      });
+    }
+
+    function updateZone(newZone, yaw, pitch) {
+      if (currentZone === newZone) return;
+
+      currentZone = newZone;
+      currentZoneEl.textContent = currentZone;
+
+      zoneDisplay.className = "";
+
+      if (currentZone === "BILDSCHIRM") {
+        zoneDisplay.classList.add("zone-bildschirm");
+        zoneDisplay.textContent = "Hauptbildschirm / Straße";
+      } else if (currentZone === "INFOTAINMENT") {
+        zoneDisplay.classList.add("zone-infotainment");
+        zoneDisplay.textContent = "Infotainment (Rechts Unten)";
+      } else if (currentZone === "LENKRAD") {
+        zoneDisplay.classList.add("zone-lenkrad");
+        zoneDisplay.textContent = "Lenkrad / Instrumente";
+      } else {
+        zoneDisplay.classList.add("zone-weggedreht");
+        zoneDisplay.textContent = "Blick weggedreht";
+      }
+    }
+
+    // CSV Export
+    document.getElementById("btn-export").addEventListener("click", () => {
+      if (logs.length === 0) {
+        alert("Keine Daten vorhanden.");
+        return;
+      }
+
+      let csvContent = "data:text/csv;charset=utf-8,Timestamp_ms,Yaw,Pitch,Zone\n";
+      logs.forEach(row => {
+        csvContent += `${row.timestamp},${row.yaw},${row.pitch},${row.zone}\n`;
+      });
+
+      const encodedUri = encodeURI(csvContent);
+      const link = document.createElement("a");
+      link.setAttribute("href", encodedUri);
+      link.setAttribute("download", `gaze_3d_pose_log_${Date.now()}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    });
+  </script>
+</body>
+</html>
